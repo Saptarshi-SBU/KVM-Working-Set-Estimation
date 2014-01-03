@@ -1,0 +1,234 @@
+#!/usr/bin/python
+#
+# Low-level QEMU shell on top of QMP.
+#
+# Copyright (C) 2009, 2010 Red Hat Inc.
+#
+# Authors:
+#  Luiz Capitulino <lcapitulino@redhat.com>
+#
+# This work is licensed under the terms of the GNU GPL, version 2.  See
+# the COPYING file in the top-level directory.
+#
+# Usage:
+#
+# Start QEMU with:
+#
+# # qemu [...] -qmp unix:./qmp-sock,server
+#
+# Run the shell:
+#
+# $ qmp-shell ./qmp-sock
+#
+# Commands have the following format:
+#
+#    < command-name > [ arg-name1=arg1 ] ... [ arg-nameN=argN ]
+#
+# For example:
+#
+# (QEMU) device_add driver=e1000 id=net1
+# {u'return': {}}
+# (QEMU)
+
+import qmp
+import readline
+import sys
+import pprint
+import time
+import wss_estimation
+
+
+class QMPCompleter(list):
+    def complete(self, text, state):
+        for cmd in self:
+            if cmd.startswith(text):
+                if not state:
+                    return cmd
+                else:
+                    state -= 1
+
+class QMPShellError(Exception):
+    pass
+
+class QMPShellBadPort(QMPShellError):
+    pass
+
+# TODO: QMPShell's interface is a bit ugly (eg. _fill_completion() and
+#       _execute_cmd()). Let's design a better one.
+
+class QMPShell(qmp.QEMUMonitorProtocol):
+    def __init__(self, address, pp=None):
+        qmp.QEMUMonitorProtocol.__init__(self, self.__get_address(address))
+        self._greeting = None
+        self._completer = None
+        self._pp = pp
+	#self.cmd = ["query-balloon", "balloon"]
+
+    def __get_address(self, arg):
+        """
+        Figure out if the argument is in the port:host form, if it's not it's
+        probably a file path.
+        """
+        addr = arg.split(':')
+        if len(addr) == 2:
+            try:
+                port = int(addr[1])
+            except ValueError:
+                raise QMPShellBadPort
+            return ( addr[0], port )
+        # socket path
+        return arg
+
+    def _fill_completion(self):
+        for cmd in self.cmd('query-commands')['return']:
+            self._completer.append(cmd['name'])
+
+    def __completer_setup(self):
+        self._completer = QMPCompleter()
+        self._fill_completion()
+        readline.set_completer(self._completer.complete)
+        readline.parse_and_bind("tab: complete")
+        # XXX: default delimiters conflict with some command names (eg. query-),
+        # clearing everything as it doesn't seem to matter
+        readline.set_completer_delims('')
+
+    def __build_cmd(self, cmdline):
+        """
+        Build a QMP input object from a user provided command-line in the
+        following format:
+    
+            < command-name > [ arg-name1=arg1 ] ... [ arg-nameN=argN ]
+        """
+        cmdargs = cmdline.split()
+        qmpcmd = { 'execute': cmdargs[0], 'arguments': {} }
+        for arg in cmdargs[1:]:
+            opt = arg.split('=')
+            try:
+                if(len(opt) > 2):
+                    opt[1] = '='.join(opt[1:])
+                value = int(opt[1])
+            except ValueError:
+                if opt[1] == 'true':
+                    value = True
+                elif opt[1] == 'false':
+                    value = False
+                else:
+                    value = opt[1]
+            qmpcmd['arguments'][opt[0]] = value
+        return qmpcmd
+
+    def _execute_cmd(self, cmdline):
+        try:
+            qmpcmd = self.__build_cmd(cmdline)
+        except:
+            print 'command format: <command-name> ',
+            print '[arg-name1=arg1] ... [arg-nameN=argN]'
+            return True
+        resp = self.cmd_obj(qmpcmd)
+        
+        if resp is None:
+            print 'Disconnected'
+        #    return False
+
+        if self._pp is not None:
+            self._pp.pprint(resp)
+        #else:
+        #    print resp
+        #return True
+	return resp
+
+    def connect(self):
+        self._greeting = qmp.QEMUMonitorProtocol.connect(self)
+        self.__completer_setup()
+
+    def show_banner(self, msg='Welcome to the QMP low-level shell!'):
+        print msg
+        version = self._greeting['QMP']['version']['qemu']
+        print 'Connected to QEMU %d.%d.%d\n' % (version['major'],version['minor'],version['micro'])
+    def read_exec_command(self, prompt):
+        """
+        Read and execute a command.
+
+        @return True if execution was ok, return False if disconnected.
+        """
+        try:
+            cmdline = raw_input(prompt)
+	    #print cmdline
+        except EOFError:
+            print
+            return False
+        if cmdline == '':
+            for ev in self.get_events():
+                print ev
+            self.clear_events()
+            return True
+        else:
+            return self._execute_cmd(cmdline)
+
+
+def die(msg):
+    sys.stderr.write('ERROR: %s\n' % msg)
+    sys.exit(1)
+
+def fail_cmdline(option=None):
+    if option:
+        sys.stderr.write('ERROR: bad command-line option \'%s\'\n' % option)
+    sys.stderr.write('qemu-shell [ -p ] [ -H ] < UNIX socket path> | < TCP address:port >\n')
+    sys.exit(1)
+
+def main():
+    addr = ''
+    qemu = None
+    hmp = False
+    pp = None
+
+    try:
+        for arg in sys.argv[1:]:
+            if arg == "-p":
+                if pp is not None:
+                    fail_cmdline(arg)
+                pp = pprint.PrettyPrinter(indent=4)
+            else:
+                if qemu is not None:
+                    fail_cmdline(arg)
+                else:
+                    qemu = QMPShell(arg, pp)
+                addr = arg
+
+        if qemu is None:
+            fail_cmdline()
+    except QMPShellBadPort:
+        die('bad port number in command-line')
+
+    try:
+        qemu.connect()
+    except qmp.QMPConnectError:
+        die('Didn\'t get QMP greeting message')
+    except qmp.QMPCapabilitiesError:
+        die('Could not negotiate capabilities')
+    except qemu.error:
+        die('Could not connect to %s' % addr)
+
+    qemu.show_banner()
+    while qemu.read_exec_command('(QEMU) '):
+        pass
+    qemu.close()
+
+if __name__ == '__main__':
+    #main()
+    arg  = sys.argv[1:]
+    for arg in sys.argv[1:]:
+        print arg
+    print sys.argv[1:]	
+    pp = None
+    qemu = QMPShell(arg, pp)
+    qemu.connect()
+    qemu.show_banner()
+    #wss = wss_estimation.wss_est_init(wss_estimation,qemu);
+    wss = wss_estimation.kmainloop(wss_estimation,qemu); 
+    if wss == -1 :
+       print 'ERROR'
+    else :
+       print wss
+    qemu.close()
+    
